@@ -46,7 +46,7 @@ enum LOCO_MODE {
 typedef struct LOCOContext {
     AVCodecContext *avctx;
     int lossy;
-    int mode;
+    enum LOCO_MODE mode;
 } LOCOContext;
 
 typedef struct RICEContext {
@@ -130,12 +130,15 @@ static int loco_decode_plane(LOCOContext *l, uint8_t *data, int width, int heigh
 {
     RICEContext rc;
     int val;
+    int ret;
     int i, j;
 
     if(buf_size<=0)
         return -1;
 
-    init_get_bits8(&rc.gb, buf, buf_size);
+    if ((ret = init_get_bits8(&rc.gb, buf, buf_size)) < 0)
+        return ret;
+
     rc.save  = 0;
     rc.run   = 0;
     rc.run2  = 0;
@@ -327,5 +330,5 @@ AVCodec ff_loco_decoder = {
     .priv_data_size = sizeof(LOCOContext),
     .init           = decode_init,
     .decode         = decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    .capabilities   = AV_CODEC_CAP_DR1,
 };

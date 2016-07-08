@@ -43,8 +43,6 @@ struct Track {
     int timescale;
     char codec_str[30];
     int64_t sidx_start, sidx_length;
-    int64_t  earliest_presentation;
-    uint32_t earliest_presentation_timescale;
 };
 
 struct Tracks {
@@ -54,22 +52,23 @@ struct Tracks {
     int multiple_tracks_per_file;
 };
 
-static void set_codec_str(AVCodecContext *codec, char *str, int size)
+static void set_codec_str(AVCodecParameters *codecpar, char *str, int size)
 {
-    switch (codec->codec_id) {
+    switch (codecpar->codec_id) {
     case AV_CODEC_ID_H264:
         snprintf(str, size, "avc1");
-        if (codec->extradata_size >= 4 && codec->extradata[0] == 1) {
+        if (codecpar->extradata_size >= 4 && codecpar->extradata[0] == 1) {
             av_strlcatf(str, size, ".%02x%02x%02x",
-                        codec->extradata[1], codec->extradata[2], codec->extradata[3]);
+                        codecpar->extradata[1], codecpar->extradata[2],
+                        codecpar->extradata[3]);
         }
         break;
     case AV_CODEC_ID_AAC:
         snprintf(str, size, "mp4a.40"); // 0x40 is the mp4 object type for AAC
-        if (codec->extradata_size >= 2) {
-            int aot = codec->extradata[0] >> 3;
+        if (codecpar->extradata_size >= 2) {
+            int aot = codecpar->extradata[0] >> 3;
             if (aot == 31)
-                aot = ((AV_RB16(codec->extradata) >> 5) & 0x3f) + 32;
+                aot = ((AV_RB16(codecpar->extradata) >> 5) & 0x3f) + 32;
             av_strlcatf(str, size, ".%d", aot);
         }
         break;
@@ -95,14 +94,6 @@ static int find_sidx(struct Tracks *tracks, int start_index,
         if (size < 8)
             break;
         if (tag == MKBETAG('s', 'i', 'd', 'x')) {
-            int version, track_id;
-            uint32_t timescale;
-            int64_t earliest_presentation;
-            version = avio_r8(f);
-            avio_rb24(f); /* flags */
-            track_id = avio_rb32(f);
-            timescale = avio_rb32(f);
-            earliest_presentation = version ? avio_rb64(f) : avio_rb32(f);
             for (i = start_index; i < tracks->nb_tracks; i++) {
                 struct Track *track = tracks->tracks[i];
                 if (!track->sidx_start) {
@@ -110,10 +101,6 @@ static int find_sidx(struct Tracks *tracks, int start_index,
                     track->sidx_length = size;
                 } else if (pos == track->sidx_start + track->sidx_length) {
                     track->sidx_length = pos + size - track->sidx_start;
-                }
-                if (track->track_id == track_id) {
-                    track->earliest_presentation = earliest_presentation;
-                    track->earliest_presentation_timescale = timescale;
                 }
             }
         }
@@ -159,7 +146,7 @@ static int handle_file(struct Tracks *tracks, const char *file)
         struct Track **temp;
         AVStream *st = ctx->streams[i];
 
-        if (st->codec->bit_rate == 0) {
+        if (st->codecpar->bit_rate == 0) {
             fprintf(stderr, "Skipping track %d in %s as it has zero bitrate\n",
                     st->id, file);
             continue;
@@ -170,8 +157,8 @@ static int handle_file(struct Tracks *tracks, const char *file)
             err = AVERROR(ENOMEM);
             goto fail;
         }
-        temp = av_realloc(tracks->tracks,
-                          sizeof(*tracks->tracks) * (tracks->nb_tracks + 1));
+        temp = av_realloc_array(tracks->tracks, tracks->nb_tracks + 1,
+                                sizeof(*tracks->tracks));
         if (!temp) {
             av_free(track);
             err = AVERROR(ENOMEM);
@@ -184,12 +171,12 @@ static int handle_file(struct Tracks *tracks, const char *file)
         if ((ptr = strrchr(file, '/')))
             track->name = ptr + 1;
 
-        track->bitrate   = st->codec->bit_rate;
+        track->bitrate   = st->codecpar->bit_rate;
         track->track_id  = st->id;
         track->timescale = st->time_base.den;
         track->duration  = st->duration;
-        track->is_audio  = st->codec->codec_type == AVMEDIA_TYPE_AUDIO;
-        track->is_video  = st->codec->codec_type == AVMEDIA_TYPE_VIDEO;
+        track->is_audio  = st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+        track->is_video  = st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
 
         if (!track->is_audio && !track->is_video) {
             fprintf(stderr,
@@ -204,14 +191,14 @@ static int handle_file(struct Tracks *tracks, const char *file)
                                                 track->timescale, AV_ROUND_UP));
 
         if (track->is_audio) {
-            track->channels    = st->codec->channels;
-            track->sample_rate = st->codec->sample_rate;
+            track->channels    = st->codecpar->channels;
+            track->sample_rate = st->codecpar->sample_rate;
         }
         if (track->is_video) {
-            track->width  = st->codec->width;
-            track->height = st->codec->height;
+            track->width  = st->codecpar->width;
+            track->height = st->codecpar->height;
         }
-        set_codec_str(st->codec, track->codec_str, sizeof(track->codec_str));
+        set_codec_str(st->codecpar, track->codec_str, sizeof(track->codec_str));
 
         tracks->nb_tracks++;
     }
@@ -252,14 +239,13 @@ static int output_mpd(struct Tracks *tracks, const char *filename)
     int nb_tracks_buf[2] = { 0 };
     int *nb_tracks;
     int set, nb_sets;
-    int64_t latest_start = 0;
 
     if (!tracks->multiple_tracks_per_file) {
         adaptation_sets = adaptation_sets_buf;
         nb_tracks = nb_tracks_buf;
         nb_sets = 2;
         for (i = 0; i < 2; i++) {
-            adaptation_sets[i] = av_malloc(sizeof(*adaptation_sets[i]) * tracks->nb_tracks);
+            adaptation_sets[i] = av_malloc_array(tracks->nb_tracks, sizeof(*adaptation_sets[i]));
             if (!adaptation_sets[i]) {
                 ret = AVERROR(ENOMEM);
                 goto err;
@@ -299,17 +285,7 @@ static int output_mpd(struct Tracks *tracks, const char *filename)
     fprintf(out, "\"\n");
     fprintf(out, "\tminBufferTime=\"PT5S\">\n");
 
-    for (i = 0; i < tracks->nb_tracks; i++) {
-        int64_t start = av_rescale_rnd(tracks->tracks[i]->earliest_presentation,
-                                       AV_TIME_BASE,
-                                       tracks->tracks[i]->earliest_presentation_timescale,
-                                       AV_ROUND_UP);
-        latest_start = FFMAX(start, latest_start);
-    }
-    fprintf(out, "\t<Period start=\"");
-    write_time(out, latest_start, 3, AV_ROUND_UP);
-    fprintf(out, "\">\n");
-
+    fprintf(out, "\t<Period start=\"PT0.0S\">\n");
 
     for (set = 0; set < nb_sets; set++) {
         if (nb_tracks[set] == 0)
